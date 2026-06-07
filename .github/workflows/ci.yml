@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile
+        run: python -m py_compile agent.py
+
+      - name: Validate personas
+        run: |
+          python - <<'EOF'
+          import json, pathlib
+          personas = sorted(pathlib.Path("personas").glob("*.json"))
+          assert len(personas) >= 3, f"expected at least 3 personas, found {len(personas)}"
+          for p in personas:
+              d = json.loads(p.read_text(encoding="utf-8"))
+              for field in ("name", "system_prompt", "first_message"):
+                  assert d.get(field), f"{p}: missing {field}"
+              for t in d.get("tools", []):
+                  assert t.get("name") and t.get("description"), f"{p}: bad tool {t}"
+              print("ok", p)
+          EOF
+
+      - name: Sanitizer unit checks
+        run: |
+          python - <<'EOF'
+          import agent
+          # template/structure chars are stripped from caller-supplied values
+          assert agent.fill_vars("hi {{x}}", {"x": "a{{evil}}b"}) == "hi aevilb"
+          assert "<" not in agent._sanitize_value("<script>")
+          assert len(agent._sanitize_value("x" * 500)) == 80
+          # unknown vars blank out instead of leaking template syntax
+          assert agent.fill_vars("hello {{nope}}!", {}) == "hello !"
+          print("sanitizer ok")
+          EOF
+
+      - name: CLI help
+        run: python agent.py --help

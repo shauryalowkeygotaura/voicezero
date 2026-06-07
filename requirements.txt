@@ -1,0 +1,6 @@
+# All free-tier or local components. ffmpeg must also be on PATH.
+groq>=0.11
+edge-tts>=6.1
+faster-whisper>=1.0
+sounddevice>=0.4     # mic capture (--voice mode only)
+numpy>=1.26          # VAD energy math
