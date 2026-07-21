@@ -43,12 +43,44 @@ import wave
 from datetime import datetime, timezone
 from pathlib import Path
 
+import memory  # stdlib-only cross-call memory (SQLite keyed by caller_hash)
+import tts_providers  # optional TTS backends + EN/HI language routing (stdlib at import)
+
 HERE = Path(__file__).resolve().parent
 DEFAULT_PERSONA = HERE / "personas" / "receptionist.json"
 CALL_LOG = HERE / "call_log.jsonl"
 
-STT_MODEL = os.getenv("WHISPER_MODEL", "base")  # tiny/base/small/medium
+# "small" is the sweet spot for Indian English / Hinglish on CPU int8: clearly
+# better than "base" without much speed cost. Set WHISPER_MODEL=medium for more
+# accuracy if the CPU can handle it (slower); tiny/base only for weak hardware.
+STT_MODEL = os.getenv("WHISPER_MODEL", "small")  # tiny/base/small/medium (local backend)
+# Per-utterance STT language. A persona sets its own "stt_lang" (e.g. the Hinglish
+# caller uses "hi"); this env is only the default when a persona doesn't. Use
+# "auto" to let Whisper detect per utterance. NOTE: forcing "en" on a Hindi call
+# is the classic reason Hinglish STT comes out garbled — set "hi" or "auto".
+WHISPER_LANG = os.getenv("WHISPER_LANG", "en")   # en | hi | auto | any ISO code
+# STT backend ladder:
+#   auto  (default) best AVAILABLE, each falling to the next on failure:
+#         sarvam (if SARVAM_API_KEY) -> groq large-v3 (if a Groq key) -> local.
+#         So a LIVE call (which already needs a Groq key) transcribes on Groq's
+#         large-v3-turbo automatically — a big jump over local 'small' for Hindi/
+#         accents — while --loopback (no key) stays fully on your CPU.
+#   local faster-whisper on THIS machine. Free, offline, private. Set this to keep
+#         audio fully on-device.
+#   groq  Groq cloud Whisper only (production server, nothing local).
+#   sarvam Sarvam Saarika only (best Indian/code-switch STT; needs SARVAM_API_KEY).
+STT_BACKEND = os.getenv("STT_BACKEND", "auto")  # auto | local | groq | sarvam
+GROQ_STT_MODEL = os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")
 SAMPLE_RATE = 16000
+
+# Domain vocabulary fed to Whisper as an initial_prompt so it biases toward
+# clinic terms and common Indian names instead of guessing generic words.
+# Personas can extend this via a "hotwords" list in their JSON.
+DEFAULT_HOTWORDS = (
+    "appointment, doctor, dentist, clinic, root canal, cleaning, RCT, crowning, "
+    "filling, extraction, checkup, Dr, Sharma, Patel, Gupta, Reddy, Khan, "
+    "today, tomorrow, morning, evening, afternoon"
+)
 
 # Each model has its OWN per-org daily token pool on Groq, so chaining models
 # multiplies free headroom on a single key. GROQ_API_KEYS (comma separated,
@@ -157,24 +189,125 @@ def load_persona(path: Path, variables: dict) -> dict:
     # name -> fixed spoken line for tool-calls-only turns, so the listener
     # never gets dead air while a tool fires (the classic silent-turn bug).
     tool_speech = {t["name"]: t["speech_line"] for t in p.get("tools", []) if t.get("speech_line")}
+    # Extra STT vocabulary the persona wants Whisper biased toward (clinic name,
+    # doctor names, plan names). Accept a list or a comma string; always store a
+    # string, plus the persona name itself so the agent hears its own clinic.
+    hw = p.get("hotwords", "")
+    if isinstance(hw, (list, tuple)):
+        hw = ", ".join(str(x) for x in hw)
+    hotwords = ", ".join(part for part in (str(hw).strip(), str(p["name"]).strip()) if part)
     return {
         "name": p["name"],
         "system_prompt": fill_vars(p["system_prompt"], variables),
         "first_message": fill_vars(p["first_message"], variables),
-        "voice": p.get("voice", "en-US-AriaNeural"),
+        # Indian English voice by default so callers hear a natural local accent.
+        # Kept for reference; the actual per-reply routing uses "tts" below.
+        "voice": p.get("voice", "en-IN-NeerjaNeural"),
+        # Per-language TTS voice profiles. Each agent reply is routed to the
+        # profile for its detected language (tts_providers.pick_voice), so the
+        # agent speaks English in an English voice and Hindi in a Hindi voice and
+        # switches on the fly as the call flows. See _build_tts_map for the schema.
+        "tts": _build_tts_map(p),
+        # STT language for THIS persona's callers ("en" | "hi" | "auto"). Defaults
+        # to the WHISPER_LANG env. A Hinglish persona should set "hi" (or "auto").
+        "stt_lang": p.get("stt_lang", WHISPER_LANG),
+        # Optional per-persona STT backend override ("auto"|"local"|"groq"|"sarvam").
+        # Empty -> use the global STT_BACKEND env. Lets one voice agent stay fully
+        # local/private while another uses cloud STT, without touching env vars.
+        "stt_backend": p.get("stt_backend", ""),
         "rate": p.get("rate", "+5%"),
         "model": p.get("model", "llama-3.3-70b-versatile"),
         "temperature": p.get("temperature", 0.4),
         "max_tokens": p.get("max_tokens", 200),
         "tools": tools,
         "tool_speech": tool_speech,
+        "hotwords": hotwords,
         "summary_prompt": p.get("summary_prompt", ""),
     }
 
 
+# Free edge-tts fallback voice per language, so on-the-fly routing always has a
+# guaranteed voice even when no optional backend (kokoro/sarvam) is installed.
+_EDGE_DEFAULTS = {"en": "en-IN-NeerjaNeural", "hi": "hi-IN-SwaraNeural"}
+
+
+def _build_tts_map(p: dict) -> dict:
+    """Normalize a persona's TTS config into {"en": profile, "hi": profile, ...}
+    where a profile is {provider, voice, edge_voice, rate}. Two input shapes:
+
+      NEW (enables EN<->HI switching) — a "tts" block, one entry per language:
+        "tts": {
+          "en": {"provider": "kokoro", "voice": "af_heart", "edge_voice": "en-US-AriaNeural"},
+          "hi": {"provider": "sarvam", "voice": "anushka",  "edge_voice": "hi-IN-SwaraNeural"}
+        }
+      LEGACY (single voice, no switching) — flat "tts_provider"/"tts_voice"/"voice"
+        fields; every language routes to that one voice, i.e. old behavior intact.
+
+    provider defaults to "edge" (always-there); if an optional provider is
+    unavailable at call time, tts_to_wav falls back to edge_voice for that same
+    language. So new personas gain switching and old personas keep working."""
+    rate = p.get("rate", "+5%")
+    block = p.get("tts")
+    m: dict = {}
+    if isinstance(block, dict):
+        for lang, e in block.items():
+            if not isinstance(e, dict):
+                continue
+            m[lang] = {
+                "provider": e.get("provider", "edge"),
+                "voice": e.get("voice", ""),
+                "edge_voice": e.get("edge_voice", _EDGE_DEFAULTS.get(lang, "en-IN-NeerjaNeural")),
+                "rate": e.get("rate", rate),
+            }
+    if not m:
+        # Legacy single-voice persona: one profile used for every language.
+        m["en"] = {
+            "provider": p.get("tts_provider", "edge"),
+            "voice": p.get("tts_voice", ""),
+            "edge_voice": p.get("voice", "en-IN-NeerjaNeural"),
+            "rate": rate,
+        }
+    elif "en" not in m:
+        # Persona defined only non-English voices: reuse one as the English
+        # fallback rather than dropping to an unrelated default.
+        m["en"] = next(iter(m.values()))
+    return m
+
+
 # ── audio: TTS (edge-tts -> ffmpeg -> wav), STT (faster-whisper), playback ───
 
-def tts_to_wav(text: str, voice: str, rate: str, wav_path: Path) -> None:
+def tts_to_wav(text: str, voice: str, rate: str, wav_path: Path,
+               provider: str = "edge", provider_voice: str = "") -> None:
+    """Synthesize `text` to a mono WAV at `wav_path`. edge-tts is the default and
+    the guaranteed fallback; `provider` can select an OPTIONAL backend (kokoro,
+    sarvam — see tts_providers.py). If that backend's package/model/key is missing
+    or the call fails, we silently drop back to edge-tts, so a turn is never lost
+    to an un-installed extra. `voice` is always a valid edge voice (the fallback);
+    `provider_voice` is the provider-specific voice name when a persona sets one."""
+    if provider and provider != "edge":
+        try:
+            if tts_providers.synth(provider, text, provider_voice, rate, wav_path):
+                return
+        except Exception as e:
+            print(f"  [warn] TTS provider {provider!r} unavailable "
+                  f"({type(e).__name__}: {e}); falling back to edge-tts.", file=sys.stderr)
+    _edge_to_wav(text, voice, rate, wav_path)
+
+
+def speak(text: str, wav_path: Path, persona: dict) -> dict:
+    """Route one agent utterance to the best voice for ITS language and synthesize
+    it to wav_path. Detects en/hi, picks the persona's profile for that language,
+    then hands off to tts_to_wav (which still edge-falls-back per language). This
+    is the on-the-fly EN<->HI switch: consistent voice within an utterance, a
+    different voice next turn if the language changed. Returns the chosen profile
+    (with a "lang" key) for diagnostics."""
+    profile = tts_providers.pick_voice(text, persona["tts"])
+    tts_to_wav(text, profile["edge_voice"], profile["rate"], wav_path,
+               profile["provider"], profile["voice"])
+    return {**profile, "lang": tts_providers.detect_lang(text)}
+
+
+def _edge_to_wav(text: str, voice: str, rate: str, wav_path: Path) -> None:
     import edge_tts
 
     if not shutil.which("ffmpeg"):
@@ -214,14 +347,156 @@ def play_wav(path: Path) -> None:
 _stt_model = None
 
 
-def stt(wav_path: Path) -> str:
+def _stt_chain(backend: str = "") -> list[str]:
+    """Ordered STT backends to try for one utterance. `backend` (a persona's
+    stt_backend) overrides the global STT_BACKEND env; empty -> the env. An
+    explicit local/groq/sarvam is honored as-is (no surprise fallbacks on a
+    server); 'auto' picks the best AVAILABLE and falls through on failure,
+    mirroring the LLM model/key rotation: sarvam (if keyed) -> groq -> local."""
+    b = (backend or STT_BACKEND or "auto").lower()
+    if b in ("local", "groq", "sarvam"):
+        return [b]
+    chain = []
+    if os.getenv("SARVAM_API_KEY", "").strip():
+        chain.append("sarvam")
+    if _groq_keys():
+        chain.append("groq")
+    chain.append("local")
+    return chain
+
+
+def stt(wav_path: Path, hotwords: str = "", lang: str | None = None,
+        backend: str = "", strict: bool = False) -> str:
+    # Domain biasing shared by every backend: seed the recognizer with clinic/name
+    # vocabulary so it leans toward the words callers actually say.
+    vocab = (DEFAULT_HOTWORDS + (", " + hotwords if hotwords else "")).strip(", ")
+    lang = WHISPER_LANG if lang is None else lang
+    last: Exception | None = None
+    for name in _stt_chain(backend):
+        try:
+            return _STT_BACKENDS[name](wav_path, vocab, lang)
+        except Exception as e:  # unavailable/rate-limited/network: try the next
+            last = e
+            continue
+    # A live call must never crash on a transient STT hiccup: degrade to "no speech
+    # heard" so the caller is simply re-prompted. Diagnostics pass strict=True so
+    # --selftest/--loopback surface the real error instead.
+    if strict:
+        raise last or RuntimeError("no STT backend available")
+    print(f"  [warn] STT failed ({type(last).__name__ if last else 'NoBackend'}: {last}); "
+          "treating as no speech.", file=sys.stderr)
+    return ""
+
+
+def _whisper_lang(lang: str) -> str | None:
+    """Map our lang tag to a Whisper `language` arg. 'auto'/'' -> None so Whisper
+    detects the language itself instead of being forced into the wrong one."""
+    lang = (lang or "").strip().lower()
+    return None if lang in ("", "auto") else lang
+
+
+def _transcribe_local(wav_path: Path, vocab: str, lang: str) -> str:
+    """faster-whisper on this machine. Free, offline, no per-call cost, fully
+    private. Best for dev/testing; needs your PC on, so not ideal for a live line."""
     global _stt_model
     if _stt_model is None:
         from faster_whisper import WhisperModel
         print(f"  [stt] loading faster-whisper '{STT_MODEL}' (first run downloads the model)...")
         _stt_model = WhisperModel(STT_MODEL, device="cpu", compute_type="int8")
-    segments, _info = _stt_model.transcribe(str(wav_path), vad_filter=True)
+    opts = dict(
+        beam_size=5,                  # wider search than greedy default -> fewer errors
+        temperature=0,                # deterministic; no random fallback decodes
+        condition_on_previous_text=False,  # stops one bad turn cascading into the next
+        vad_filter=True,
+        vad_parameters=dict(min_silence_duration_ms=500),  # don't clip trailing words
+        initial_prompt=vocab,
+    )
+    wl = _whisper_lang(lang)          # None => auto-detect (don't force a language)
+    if wl:
+        opts["language"] = wl
+    # hotwords is a newer faster-whisper feature; guard it so older installs work.
+    try:
+        segments, _info = _stt_model.transcribe(str(wav_path), hotwords=vocab, **opts)
+    except TypeError:
+        segments, _info = _stt_model.transcribe(str(wav_path), **opts)
     return " ".join(s.text.strip() for s in segments).strip()
+
+
+def _transcribe_groq(wav_path: Path, vocab: str, lang: str) -> str:
+    """Cloud STT via Groq's hosted Whisper (large-v3-turbo by default) — clearly
+    better on Hindi/Hinglish and accents than local 'small', and nearly free.
+    Nothing runs locally, so the agent can live on a tiny always-on server. Reuses
+    the same Groq keys and per-key failover as the LLM. Pennies per call."""
+    from groq import Groq
+    keys = _groq_keys()
+    if not keys:
+        raise RuntimeError("Groq STT needs a GROQ_API_KEY (free at console.groq.com/keys)")
+    audio = wav_path.read_bytes()
+    wl = _whisper_lang(lang)
+    last = None
+    for key in keys:
+        try:
+            kwargs = dict(
+                file=(wav_path.name, audio),
+                model=GROQ_STT_MODEL,
+                prompt=vocab,                 # same domain biasing as the local path
+                temperature=0,
+                response_format="text",
+            )
+            if wl:
+                kwargs["language"] = wl       # else let Whisper detect the language
+            resp = Groq(api_key=key).audio.transcriptions.create(**kwargs)
+            return (resp if isinstance(resp, str) else getattr(resp, "text", "")).strip()
+        except Exception as e:  # rate limit, auth, network, API error: try the next key
+            last = e
+            continue
+    raise last or RuntimeError("no usable GROQ key for STT")
+
+
+def _transcribe_sarvam(wav_path: Path, vocab: str, lang: str) -> str:
+    """Sarvam Saarika STT — best-in-class Indian-language and code-switched
+    transcription, the STT twin of the sarvam TTS voice. Key-gated (SARVAM_API_KEY)
+    and never a default; no package, just a multipart POST over stdlib urllib. Not
+    free at scale, so it only runs when explicitly chosen or auto-picked with a key."""
+    import json
+    import urllib.request
+    import uuid
+
+    key = os.getenv("SARVAM_API_KEY", "").strip()
+    if not key:
+        raise RuntimeError("sarvam STT needs SARVAM_API_KEY")
+    # Saarika wants a BCP-47 code, or "unknown" to auto-detect (handles code-switch).
+    lang_code = {"hi": "hi-IN", "en": "en-IN"}.get(_whisper_lang(lang) or "", "unknown")
+    boundary = uuid.uuid4().hex
+    parts: list[bytes] = []
+
+    def _field(name: str, value: str) -> None:
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n'
+            f"{value}\r\n".encode("utf-8"))
+
+    _field("model", os.getenv("SARVAM_STT_MODEL", "saarika:v2"))
+    _field("language_code", lang_code)
+    parts.append(
+        (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; '
+         f'filename="{wav_path.name}"\r\nContent-Type: audio/wav\r\n\r\n').encode("utf-8")
+        + wav_path.read_bytes() + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode("utf-8"))
+
+    req = urllib.request.Request(
+        "https://api.sarvam.ai/speech-to-text", data=b"".join(parts),
+        headers={"api-subscription-key": key,
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    with urllib.request.urlopen(req, timeout=30) as resp:  # non-200 raises -> next backend
+        payload = json.loads(resp.read().decode("utf-8"))
+    return (payload.get("transcript") or "").strip()
+
+
+_STT_BACKENDS = {
+    "local": _transcribe_local,
+    "groq": _transcribe_groq,
+    "sarvam": _transcribe_sarvam,
+}
 
 
 def record_utterance(max_seconds: int = 15, silence_after: float = 1.2) -> Path | None:
@@ -276,10 +551,20 @@ class Call:
     """One conversation. Async-tool semantics like the hosted platforms: tools
     return {'status':'queued'} instantly, then a follow-up generation speaks."""
 
-    def __init__(self, persona: dict, variables: dict):
+    def __init__(self, persona: dict, variables: dict, caller_hash: str = ""):
         self.p = persona
         self.variables = variables
-        self.history: list[dict] = [{"role": "assistant", "content": persona["first_message"]}]
+        # A returning caller (recognized by caller_hash) gets their last context
+        # folded into the opening line so the agent greets them by memory instead
+        # of starting cold. First-time/unknown caller -> note is "" -> unchanged.
+        self.caller_hash = caller_hash if memory._valid_hash(caller_hash) else ""
+        first_message = persona["first_message"]
+        if self.caller_hash:
+            note = memory.greeting_note(self.caller_hash)
+            if note:
+                first_message = f"{note} {first_message}"
+        self.first_message = first_message
+        self.history: list[dict] = [{"role": "assistant", "content": first_message}]
         self.events: list[dict] = []
         self.ended = False
         self.end_reason = ""
@@ -385,13 +670,14 @@ class Call:
             return {}
 
     def finish(self) -> dict:
+        summary = self._summarize()
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "persona": self.p["name"],
             "variables": self.variables,
             "end_reason": self.end_reason,
             "events": [{k: v for k, v in e.items() if k != "t"} for e in self.events],
-            "summary": self._summarize(),
+            "summary": summary,
             "transcript": [m for m in self.history if m["role"] in ("user", "assistant") and m.get("content")],
         }
         try:
@@ -399,13 +685,26 @@ class Call:
                 f.write(json.dumps(record, ensure_ascii=False) + "\n")
         except OSError as e:
             print(f"  [warn] could not write call log: {e}", file=sys.stderr)
+        # Persist this caller's last context so the NEXT call can greet them by
+        # memory. Keyed by caller_hash; a no-op (never an exception) when there is
+        # no recognized caller, so a missing number never breaks a finished call.
+        if self.caller_hash:
+            try:
+                memory.store(
+                    self.caller_hash,
+                    summary=(summary.get("summary") or "") if isinstance(summary, dict) else "",
+                    outcome=(summary.get("outcome") or "") if isinstance(summary, dict) else "",
+                    extra={"persona": self.p["name"], "end_reason": self.end_reason},
+                )
+            except Exception as e:  # memory is best-effort; never fail the call on it
+                print(f"  [warn] could not store caller memory ({type(e).__name__})", file=sys.stderr)
         return record
 
 
 # ── modes ────────────────────────────────────────────────────────────────────
 
 def run_text(call: Call) -> None:
-    print(f"\nAGENT: {call.p['first_message']}")
+    print(f"\nAGENT: {call.first_message}")
     print("(type your replies; /quit to end)\n")
     while not call.ended:
         try:
@@ -438,22 +737,22 @@ def run_voice(call: Call) -> None:
     finally:
         silence.unlink(missing_ok=True)
     say = tmp / "voicezero_agent_say.wav"
-    tts_to_wav(call.p["first_message"], call.p["voice"], call.p["rate"], say)
-    print(f"AGENT: {call.p['first_message']}")
+    speak(call.first_message, say, call.p)  # routed to the first message's language
+    print(f"AGENT: {call.first_message}")
     play_wav(say)
     while not call.ended:
         utt = record_utterance()
         if utt is None:
             print("  [mic] no speech detected; ending call.")
             break
-        heard = stt(utt)
+        heard = stt(utt, call.p["hotwords"], call.p["stt_lang"], call.p["stt_backend"])
         if not heard:
             continue
         print(f"YOU:   {heard}")
         reply = call.turn(heard)
         if reply:
             print(f"AGENT: {reply}")
-            tts_to_wav(reply, call.p["voice"], call.p["rate"], say)
+            speak(reply, say, call.p)  # re-detects language each turn -> EN/HI switch
             play_wav(say)
     record = call.finish()
     s = record.get("summary") or {}
@@ -465,14 +764,14 @@ def run_loopback(persona: dict) -> None:
     """TTS -> STT round trip. Proves the audio stack with no API key."""
     tmp = Path(tempfile.gettempdir())
     line = "If you can read this back, the audio stack works end to end."
-    print(f"[1/2] TTS via edge-tts ({persona['voice']})...")
     t0 = time.time()
     wav = tmp / "voicezero_loopback.wav"
-    tts_to_wav(line, persona["voice"], persona["rate"], wav)
-    print(f"      ok ({time.time()-t0:.1f}s, {wav.stat().st_size} bytes) at $0.00")
-    print(f"[2/2] STT it back via faster-whisper '{STT_MODEL}'...")
+    v = speak(line, wav, persona)
+    print(f"[1/2] TTS via {v['provider']} ({v['voice'] or v['edge_voice']}) "
+          f"ok ({time.time()-t0:.1f}s, {wav.stat().st_size} bytes) at $0.00")
+    print(f"[2/2] STT it back via {persona['stt_backend'] or STT_BACKEND} backend...")
     t0 = time.time()
-    heard = stt(wav)
+    heard = stt(wav, lang=persona["stt_lang"], backend=persona["stt_backend"], strict=True)
     if not heard:
         raise SystemExit("LOOPBACK FAIL: STT returned empty text")
     print(f"      heard: {heard!r} ({time.time()-t0:.1f}s) at $0.00")
@@ -483,15 +782,15 @@ def run_selftest(call: Call) -> None:
     """Headless end to end: proves TTS, STT, LLM and tools with no mic."""
     tmp = Path(tempfile.gettempdir())
     user_line = "Hi, what exactly can you help me with?"
-    print(f"[1/4] TTS user line via edge-tts ({call.p['voice']})...")
     t0 = time.time()
     wav = tmp / "voicezero_selftest_user.wav"
-    tts_to_wav(user_line, call.p["voice"], call.p["rate"], wav)
-    print(f"      ok ({time.time()-t0:.1f}s, {wav.stat().st_size} bytes) at $0.00")
+    v = speak(user_line, wav, call.p)
+    print(f"[1/4] TTS user line via {v['provider']} ({v['voice'] or v['edge_voice']}) "
+          f"ok ({time.time()-t0:.1f}s, {wav.stat().st_size} bytes) at $0.00")
 
-    print(f"[2/4] STT it back via faster-whisper '{STT_MODEL}'...")
+    print(f"[2/4] STT it back via {call.p['stt_backend'] or STT_BACKEND} backend...")
     t0 = time.time()
-    heard = stt(wav)
+    heard = stt(wav, call.p["hotwords"], call.p["stt_lang"], call.p["stt_backend"], strict=True)
     if not heard:
         raise SystemExit("SELFTEST FAIL: STT returned empty text")
     print(f"      heard: {heard!r} ({time.time()-t0:.1f}s) at $0.00")
@@ -509,8 +808,8 @@ def run_selftest(call: Call) -> None:
 
     print("[4/4] TTS the reply...")
     out = tmp / "voicezero_selftest_agent.wav"
-    tts_to_wav(reply or "Thanks for calling!", call.p["voice"], call.p["rate"], out)
-    print(f"      ok ({out})")
+    v = speak(reply or "Thanks for calling!", out, call.p)
+    print(f"      ok via {v['provider']} [{v['lang']}] ({out})")
 
     call.finish()
     print("\nSELFTEST PASS. Full voice loop verified at $0.00 per minute.")
@@ -527,6 +826,9 @@ def main():
     ap.add_argument("--persona", default=str(DEFAULT_PERSONA), help="path to a persona JSON")
     ap.add_argument("--var", action="append", default=[], metavar="KEY=VALUE",
                     help="fill a {{variable}} in the persona (repeatable)")
+    ap.add_argument("--caller-number", default="",
+                    help="caller phone number; hashed (never stored raw) to recognize "
+                         "a returning caller and persist this call's context for next time")
     args = ap.parse_args()
 
     variables = {}
@@ -545,7 +847,10 @@ def main():
         raise SystemExit("No Groq key found. Set GROQ_API_KEY (free at console.groq.com/keys), "
                          "or run --loopback to test audio without one.")
 
-    call = Call(persona, variables)
+    # Hash the number (never store it raw) to recognize a returning caller and to
+    # key this call's stored context. Empty/absent number -> "" -> memory inert.
+    caller_hash = memory.hash_caller_number(args.caller_number.strip())
+    call = Call(persona, variables, caller_hash=caller_hash)
     if args.selftest:
         run_selftest(call)
     elif args.voice:

@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .env
 call_log.jsonl
+caller_memory.db
 *.wav
 *.mp3
 .venv/

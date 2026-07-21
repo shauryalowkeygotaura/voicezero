@@ -1,0 +1,18 @@
+# Optional TTS upgrades — NOT needed to run voicezero.
+# The default edge-tts path (in requirements.txt) always works with zero of these.
+# Install only the backend you want, then set a persona's "tts_provider".
+# If an optional backend is missing or fails, agent.py silently falls back to edge-tts.
+
+# kokoro: fully local, Apache-2.0, CPU-friendly. Best FREE quality bump for English,
+# also speaks Hindi (experimental hf_/hm_ voices). Stays $0 forever, runs offline.
+# ~310 MB model auto-downloads to ~/.cache/voicezero on first use.
+#   persona:  "tts_provider": "kokoro", "tts_voice": "af_heart"   (English)
+#             "tts_provider": "kokoro", "tts_voice": "hf_alpha"   (Hindi)
+kokoro-onnx>=0.4
+
+# sarvam (best-in-class Hindi) needs NO package — it is pure REST via stdlib urllib.
+# One SARVAM_API_KEY enables BOTH:
+#   TTS: a persona's "hi" voice, e.g.  "tts": {"hi": {"provider": "sarvam", "voice": "anushka"}}
+#   STT: the Saarika backend, via  STT_BACKEND=sarvam  (or auto, which uses it when keyed)
+# Not free at scale (₹1000 trial credits, then paid), so it is opt-in and never a
+# default; with no key everything uses free edge-tts voices and local/groq STT.

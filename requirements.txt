@@ -4,3 +4,6 @@ edge-tts>=6.1
 faster-whisper>=1.0
 sounddevice>=0.4     # mic capture (--voice mode only)
 numpy>=1.26          # VAD energy math
+
+# Optional, nicer-voice TTS backends live in requirements-optional.txt. You do
+# NOT need them: edge-tts above is the always-there, zero-config, $0 default.

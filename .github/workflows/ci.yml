@@ -15,7 +15,10 @@ jobs:
           python-version: "3.11"
 
       - name: Compile
-        run: python -m py_compile agent.py
+        run: python -m py_compile agent.py memory.py tts_providers.py
+
+      - name: Cross-call memory unit tests
+        run: python -m unittest test_memory -v
 
       - name: Validate personas
         run: |

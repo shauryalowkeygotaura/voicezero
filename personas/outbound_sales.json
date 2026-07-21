@@ -1,6 +1,11 @@
 {
   "name": "outbound_sales",
   "voice": "en-IN-NeerjaNeural",
+  "stt_lang": "hi",
+  "tts": {
+    "en": {"provider": "edge", "edge_voice": "en-IN-NeerjaNeural"},
+    "hi": {"provider": "edge", "edge_voice": "hi-IN-SwaraNeural"}
+  },
   "rate": "+5%",
   "model": "llama-3.3-70b-versatile",
   "temperature": 0.4,

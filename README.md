@@ -124,7 +124,68 @@ Notes on the schema:
 - `{{variables}}` in the prompt are filled from `--var key=value`. Values are sanitized (template and structure characters stripped, length capped) before substitution, so caller data stays data.
 - `end_call` is built in and appended to every persona automatically. You never define it.
 - `speech_line` is voicezero's own field, not part of the JSON Schema sent to the LLM. If a turn is tool-calls-only, the agent speaks this fixed line so the listener never hears silence. This is the classic silent-turn bug that hosted platforms solve with tool messages; same fix, locally.
-- `voice` is any [edge-tts voice](https://gist.github.com/BettyJJ/17cbaa1de96235a7f5773b8690a20462). There are hundreds, in dozens of languages.
+- `voice` is any [edge-tts voice](https://gist.github.com/BettyJJ/17cbaa1de96235a7f5773b8690a20462) — the single-voice shorthand and the guaranteed fallback. For a bilingual agent, use the `tts` block instead (see [Better voices](#better-voices-optional)).
+- `tts` is a per-language voice map that switches the voice on the fly (below). `stt_lang` sets the caller's language for transcription (`en` / `hi` / `auto`) — a Hinglish persona should use `hi`. Optional `stt_backend` overrides the STT backend for this agent only (see [Better transcription](#better-transcription-stt)).
+
+## Better voices (optional)
+
+edge-tts is genuinely good and stays the default: zero config, zero extra dependencies, no key, and it already has [neural voices in dozens of languages](https://gist.github.com/BettyJJ/17cbaa1de96235a7f5773b8690a20462) including `hi-IN` Hindi ones. You never need anything below.
+
+### Switching English ↔ Hindi mid-call
+
+Indian callers code-switch constantly. voicezero routes **each agent reply to the best voice for that reply's language** — English replies get an English voice, Hindi/Hinglish replies get a Hindi voice — switching turn by turn as the conversation flows. It's whole-utterance routing (one consistent voice per reply, on purpose: swapping engines mid-sentence would flip the timbre and sound broken; a Hindi-capable voice reads the English words inside a Hinglish sentence just fine).
+
+Give a persona a `tts` block, one entry per language:
+
+```json
+"tts": {
+  "en": { "provider": "edge", "edge_voice": "en-IN-NeerjaNeural" },
+  "hi": { "provider": "edge", "edge_voice": "hi-IN-SwaraNeural" }
+},
+"stt_lang": "hi"
+```
+
+That's the shipped `outbound_sales` persona: **free edge voices, zero setup, but now the Hindi lines actually come out of a Hindi voice** instead of an English one straining through Devanagari. Language detection is a tiny dependency-free heuristic (Devanagari + a romanized-Hindi lexicon) tuned to *not* misfire on English — no model, no API. Per-entry fields: `provider` (default `edge`), `voice` (the provider's own voice name), `edge_voice` (the guaranteed fallback for that language), `rate`.
+
+### Upgrading a language to a better engine
+
+Swap any language's `provider` for a higher-quality backend. It mirrors the LLM model chain: if the backend's package/model/key isn't there, that reply **silently falls back to `edge_voice`** for the same language. A turn is never lost to an un-installed extra.
+
+| Provider | Where it runs | Cost | English | Hindi | Enable |
+|---|---|---|---|---|---|
+| **edge** (default) | Microsoft cloud endpoint | $0.00 | great | good (`hi-IN` voices) | nothing — it's the default |
+| **kokoro** | fully local CPU, offline | $0.00 forever | excellent | decent (experimental `hf_`/`hm_` voices) | `pip install kokoro-onnx` |
+| **sarvam** | Sarvam cloud REST | free trial, then paid | good | best-in-class | set `SARVAM_API_KEY` |
+
+```json
+"tts": {
+  "en": { "provider": "kokoro", "voice": "af_heart",  "edge_voice": "en-US-AriaNeural" },
+  "hi": { "provider": "sarvam", "voice": "anushka",   "edge_voice": "hi-IN-SwaraNeural" }
+}
+```
+
+- **kokoro** ([kokoro-82M](https://huggingface.co/hexgrad/Kokoro-82M), Apache-2.0) is the best *free* upgrade: entirely on CPU, offline once cached, $0 forever. First use auto-downloads a ~310 MB model to `~/.cache/voicezero` (override with `VOICEZERO_CACHE`).
+- **sarvam** ([Bulbul](https://www.sarvam.ai/)) has the best Hindi / Indian-language voices — the natural pick for the `hi` slot of a Hinglish agent. Pure REST (no package), opt-in via `SARVAM_API_KEY`, and the *same key* also unlocks the Saarika STT backend below.
+
+Optional deps live in `requirements-optional.txt` — install only what you want. The whole layer is [`tts_providers.py`](tts_providers.py), ~200 readable lines; adding a provider is one function plus a dict entry.
+
+## Better transcription (STT)
+
+The listener half matters as much as the voice. voicezero has a three-rung STT ladder, and `STT_BACKEND=auto` (the default) picks the best **available**, falling through on failure exactly like the LLM key rotation:
+
+| Backend | Model | Where it runs | Cost | Best for |
+|---|---|---|---|---|
+| **local** | faster-whisper (`small`) | your CPU, offline | $0.00 | private / offline dev; audio never leaves the device |
+| **groq** | `whisper-large-v3-turbo` | Groq cloud | ~free (pennies) | **the quality default** — far better Hindi/accents than local `small` |
+| **sarvam** | Saarika v2 | Sarvam cloud | free trial, then paid | best-in-class Indian / code-switched speech |
+
+`auto` resolves to `sarvam` (if `SARVAM_API_KEY`) → `groq` (if a Groq key) → `local`. Because a live call already needs a Groq key, **it transcribes on `whisper-large-v3-turbo` automatically** — the single biggest fix if your STT feels weak — while `--loopback` (no key) stays fully local.
+
+Two things that quietly wreck Hinglish STT, both fixed here:
+- **Forcing the wrong language.** Pinning Whisper to `en` mangles Hindi. STT language is now per-persona (`stt_lang`): the Hinglish persona uses `hi`, English personas use `en`, or set `auto` to detect per turn.
+- **A too-small local model.** `small` is the CPU sweet spot but has a ceiling; the `groq`/`sarvam` rungs blow past it for a fraction of a cent.
+
+Want STT fully on-device (no audio leaving your machine)? Set `STT_BACKEND=local` globally, or override **per voice agent** with a persona `stt_backend` field (`"auto"` / `"local"` / `"groq"` / `"sarvam"`; empty uses the global default). So one agent can stay fully private while another uses cloud STT, no env juggling.
 
 ## Wiring real tools
 
@@ -157,8 +218,9 @@ The post-call summary deliberately runs on `llama-3.1-8b-instant`: extraction is
 - **Turn-based, no barge-in.** You cannot interrupt the agent mid-sentence. Hosted platforms do this better today.
 - **Latency is 1.5 to 4 seconds per turn** on a normal CPU (STT + LLM + TTS, sequential). Usable for demos and internal tools; not yet indistinguishable from a human. `WHISPER_MODEL=tiny` and lower `max_tokens` help.
 - **Energy-based VAD**, not semantic. A noisy room can self-trigger the mic (raise the threshold in `record_utterance`).
+- **STT accuracy is a tradeoff.** Fully-local `small` on CPU is private and free but has a ceiling on Hindi/accented speech; the default `auto` backend sends live-call audio to Groq's `whisper-large-v3-turbo` for a big accuracy jump. Set `STT_BACKEND=local` to keep audio on-device. See [Better transcription](#better-transcription-stt).
 - **No telephony out of the box.** This is mic and speakers. See roadmap.
-- **edge-tts** uses the same endpoint as Microsoft Edge's read-aloud. Perfect for development and demos; for commercial production swap in Azure TTS (identical voices, paid) or any TTS you like, it is one function.
+- **edge-tts** (the default) uses the same endpoint as Microsoft Edge's read-aloud. Perfect for development and demos. For a better voice, especially in Hindi, drop in `kokoro` (free, local) or `sarvam` (paid, best Hindi) — see [Better voices](#better-voices-optional); for commercial-grade English, Azure TTS uses the identical voices, paid. All are one config field.
 
 ## Roadmap
 
@@ -173,16 +235,16 @@ PRs welcome. The codebase is intentionally one file so you can read all of it in
 ## FAQ
 
 **Is this actually $0.00?**
-Yes, within Groq's free-tier daily limits, which are generous for development and demos (and multiply with the rotation tricks above). STT is local compute and TTS is free. At commercial volume you would move the LLM to a paid tier and TTS to Azure, and you would still pay cents per hour, not per minute.
+Yes, within Groq's free-tier daily limits, which are generous for development and demos (and multiply with the rotation tricks above). LLM and cloud STT run on Groq's free tier; TTS is free (edge-tts) or local (kokoro). Fully-local STT (`STT_BACKEND=local`) is $0 compute. At commercial volume you would move the LLM to a paid tier and TTS to Azure/sarvam, and you would still pay cents per hour, not per minute.
 
 **Why not just use VAPI/Retell/Bland?**
 If you need phone numbers today with zero setup, use them, they are good products. voicezero exists because most voice agent work (prototyping, demos, learning, internal tools) does not need a phone number, and because understanding the loop makes you better at using any platform.
 
 **Does it speak languages other than English?**
-Yes. The LLM mirrors the caller's language and edge-tts has voices in dozens of languages. The included `outbound_sales` persona conducts calls in Hinglish with an Indian English voice.
+Yes, and it switches on the fly. Each agent reply is routed to the best voice for its language, so a bilingual persona speaks English in an English voice and Hindi in a Hindi voice, turn by turn. The included `outbound_sales` persona runs Hinglish calls this way — English lines on an Indian-English voice, Hindi lines on a Hindi voice — using free edge voices out of the box. See [Better voices](#better-voices-optional).
 
 **Where do conversations go?**
-Nowhere except `call_log.jsonl` on your machine (gitignored). Audio goes to Microsoft (TTS) and Groq (LLM text); STT never leaves your CPU.
+Nowhere except `call_log.jsonl` on your machine (gitignored). TTS text goes to Microsoft (edge) or stays local (kokoro); LLM text goes to Groq. STT audio: with the default `auto`/`groq`/`sarvam` backends the utterance is sent to that cloud API for accuracy — set `STT_BACKEND=local` to keep STT 100% on your CPU.
 
 ---
 
