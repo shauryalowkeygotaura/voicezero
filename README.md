@@ -17,12 +17,14 @@ voicezero is that exact loop, extracted from a real production outbound sales ag
 
 | Stage | Component | Cost |
 |---|---|---|
-| STT | [faster-whisper](https://github.com/SYSTRAN/faster-whisper), local CPU | $0.00 |
+| STT | [faster-whisper](https://github.com/SYSTRAN/faster-whisper) local, or Groq `whisper-large-v3-turbo` | $0.00 |
 | LLM | [Groq](https://console.groq.com) free tier (Llama 3.3 70B and friends) | $0.00 |
-| TTS | [edge-tts](https://github.com/rany2/edge-tts), Microsoft neural voices | $0.00 |
+| TTS | [edge-tts](https://github.com/rany2/edge-tts) neural voices, **auto-switching English ↔ Hindi per reply** | $0.00 |
 | Audio I/O | sounddevice mic + native playback | $0.00 |
 
-It is not a toy: it has tool calling, personas, template variables, prompt-injection sanitization, dead-air protection, model and key rotation, post-call structured summaries, and a JSONL call log.
+> **Speaks Hinglish, natively.** The agent detects the language of each reply and switches voice on the fly, English lines in an English voice, Hindi lines in a Hindi voice, turn by turn in the same call. It transcribes Hindi and English too. All on free voices, zero config. This is the thing most hosted platforms charge extra for or do badly. [How it works ↓](#switching-english--hindi-mid-call)
+
+It is not a toy: it has tool calling, personas, template variables, on-the-fly Hindi/English voice switching, prompt-injection sanitization, dead-air protection, model and key rotation, post-call structured summaries, and a JSONL call log.
 
 ## The math
 
@@ -77,6 +79,23 @@ AGENT: Wonderful, see you Thursday, Rohan. Have a great day!
 ```
 
 The `book_appointment` tool fired mid-call, the agent spoke a fixed line while it ran (no dead air), and a separate cheap model wrote a structured summary into the call log afterwards.
+
+And the same agent, following the caller from Hindi into English mid-call (the `outbound_sales` persona):
+
+```
+AGENT: Namaste! Main Riya bol rahi hoon Star Telecom se.   <- Hindi voice
+YOU:   Haan boliye, kya baat hai?
+AGENT: Aapka plan expire ho raha hai, ek behtar plan hai.  <- Hindi voice
+YOU:   So what does the new one actually cost?             (caller just switches)
+AGENT: It is three forty nine a month, with more data      <- English voice
+       and a streaming bundle.
+YOU:   Okay, go ahead and send me the details.
+AGENT: Sure, I am sending them over on WhatsApp right now.  <- English voice
+
+-- call ended: interested | interested (log: call_log.jsonl)
+```
+
+The caller never says "speak English". They just do, and the agent's next reply comes back in an English voice. The persona is told to mirror the caller's language, so the LLM replies in English; voicezero then detects that reply is English and routes it to the English voice, all on its own, turn by turn. See [Switching English ↔ Hindi](#switching-english--hindi-mid-call).
 
 ## Modes
 
