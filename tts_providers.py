@@ -18,6 +18,14 @@ Providers
           paid), so it is never a default and never a hard requirement: it turns
           on only when SARVAM_API_KEY is set, and silently no-ops to edge-tts
           otherwise.
+  fish    Cloud REST API (stdlib urllib). The only backend here that can speak in
+          a CLONED voice: point a persona's tts_voice at a Fish Audio model id
+          and the agent talks in that voice. Metered and NOT free at scale (the
+          standing free plan is ~8k credits, roughly 7 minutes of audio a month),
+          so like sarvam it is key-gated on FISH_API_KEY and no-ops to edge-tts
+          when unset. Never make it the default for an unattended calling
+          campaign: a mid-run 402 would silently swap the voice.
+          Clone a voice first with Code/fish-voice/fish_voice.py.
 
 Each synth writes a mono 16-bit PCM WAV to wav_path. Whichever sample rate the
 backend emits, downstream faster-whisper and native playback both accept it.
@@ -207,7 +215,68 @@ def _sarvam(text: str, voice: str, rate: str, wav_path: Path) -> bool:
     return True
 
 
+# ── fish audio (cloud, cloned voices, key-gated) ─────────────────────────────
+
+def _fish(text: str, voice: str, rate: str, wav_path: Path) -> bool:
+    """Fish Audio TTS over REST. The one backend that speaks in a voice cloned
+    from a real person: `voice` is a Fish model id (the `_id` returned when you
+    clone), falling back to FISH_VOICE_ID so a persona can stay voice-agnostic.
+
+    Enabled only when FISH_API_KEY is set (no key -> return False -> edge
+    fallback). Asks for `format: wav` so the caller gets the same PCM WAV every
+    other backend here writes, and `latency: low` because this runs inside a
+    live call turn, where responsiveness beats the last few percent of quality.
+
+    With no voice id resolved it still works, just in Fish's stock model voice
+    rather than a clone."""
+    import json
+    import urllib.request
+
+    key = (os.getenv("FISH_API_KEY") or os.getenv("FISH_AUDIO_API_KEY") or "").strip()
+    if not key:
+        return False  # not configured: let the caller use edge-tts
+    if not text.strip():
+        return False  # nothing to say: a blank turn would 422, not fall back usefully
+
+    body = {
+        # Fish documents no hard text cap, unlike sarvam's 2500. This is a
+        # defensive bound only: personas cap max_tokens at ~150, so a reply that
+        # reaches it means something upstream ran away, and truncating keeps the
+        # call alive instead of 422-ing the turn.
+        "text": text[:5000],
+        "format": "wav",
+        "latency": "low",
+        "normalize": True,
+        # prosody.speed is a documented multiplier clamped to 0.5-2.0, which is
+        # exactly the range _rate_to_speed already returns.
+        "prosody": {"speed": _rate_to_speed(rate)},
+    }
+    reference = (voice or os.getenv("FISH_VOICE_ID", "")).strip()
+    if reference:
+        body["reference_id"] = reference
+
+    req = urllib.request.Request(
+        "https://api.fish.audio/v1/tts",
+        data=json.dumps(body).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {key}",
+            "Content-Type": "application/json",
+            # s2.1-pro is the current top model; override when the free window
+            # closes and you drop to s2.1-pro-free.
+            "model": os.getenv("FISH_MODEL", "s2.1-pro"),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:  # non-200 raises -> fallback
+        audio = resp.read()
+    if not audio:
+        return False
+    # Fish returns a complete WAV container when format=wav.
+    wav_path.write_bytes(audio)
+    return True
+
+
 _PROVIDERS = {
     "kokoro": _kokoro,
     "sarvam": _sarvam,
+    "fish": _fish,
 }
