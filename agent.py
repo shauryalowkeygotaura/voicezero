@@ -87,7 +87,7 @@ DEFAULT_HOTWORDS = (
 # one key per Groq ACCOUNT; same-account keys share quota) multiplies further.
 MODEL_CHAIN_EXTRA = [
     "openai/gpt-oss-120b",
-    "llama-3.3-70b-versatile",
+    "qwen/qwen3.8-27b",
     "llama-3.1-8b-instant",
 ]
 
@@ -216,7 +216,7 @@ def load_persona(path: Path, variables: dict) -> dict:
         # local/private while another uses cloud STT, without touching env vars.
         "stt_backend": p.get("stt_backend", ""),
         "rate": p.get("rate", "+5%"),
-        "model": p.get("model", "llama-3.3-70b-versatile"),
+        "model": p.get("model", "qwen/qwen3.8-27b"),
         "temperature": p.get("temperature", 0.4),
         "max_tokens": p.get("max_tokens", 200),
         "tools": tools,

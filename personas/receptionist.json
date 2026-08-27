@@ -3,7 +3,7 @@
   "voice": "en-IN-NeerjaNeural",
   "stt_lang": "en",
   "rate": "+5%",
-  "model": "llama-3.3-70b-versatile",
+  "model": "qwen/qwen3.8-27b",
   "temperature": 0.4,
   "max_tokens": 150,
   "first_message": "Thanks for calling Brightsmile Dental, this is Maya. How can I help you today?",

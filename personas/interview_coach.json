@@ -2,7 +2,7 @@
   "name": "interview_coach",
   "voice": "en-US-GuyNeural",
   "rate": "+0%",
-  "model": "llama-3.3-70b-versatile",
+  "model": "qwen/qwen3.8-27b",
   "temperature": 0.5,
   "max_tokens": 180,
   "first_message": "Hey, I'm Sam, your interview coach. Tell me the role you're practicing for, and we'll do a quick mock interview.",

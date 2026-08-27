@@ -7,7 +7,7 @@
     "hi": {"provider": "edge", "edge_voice": "hi-IN-SwaraNeural"}
   },
   "rate": "+5%",
-  "model": "llama-3.3-70b-versatile",
+  "model": "qwen/qwen3.8-27b",
   "temperature": 0.4,
   "max_tokens": 150,
   "first_message": "Namaste! Main Riya bol rahi hoon Star Telecom se. Kya main aapka ek minute le sakti hoon?",
