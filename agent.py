@@ -88,7 +88,7 @@ DEFAULT_HOTWORDS = (
 MODEL_CHAIN_EXTRA = [
     "openai/gpt-oss-120b",
     "qwen/qwen3.8-27b",
-    "llama-3.1-8b-instant",
+    "qwen/qwen3.6-27b",
 ]
 
 
@@ -643,7 +643,7 @@ class Call:
     def _summarize(self) -> dict:
         """Out-of-band post-call summary: the talking model never emits
         structured data (that causes speech-less turns); a separate cheap model
-        reads the finished transcript instead. llama-3.1-8b-instant has its own
+        reads the finished transcript instead. qwen/qwen3.6-27b has its own
         Groq daily pool, so this works even when the 70b budget is spent."""
         convo = "\n".join(
             f"{'AGENT' if m['role'] == 'assistant' else 'USER'}: {m['content']}"
@@ -657,7 +657,7 @@ class Call:
             "follow_up_needed (true or false).")
         try:
             _model, resp = chat_with_rotation(
-                "llama-3.1-8b-instant",
+                "qwen/qwen3.6-27b",
                 temperature=0,
                 max_tokens=200,
                 response_format={"type": "json_object"},

@@ -230,7 +230,7 @@ Groq's free tier gives each **model** its own daily token pool per account. voic
 1. **Model rotation**: every LLM call walks a chain (`gpt-oss-120b`, `llama-3.3-70b`, `llama-3.1-8b`). Rate limited on one pool? The call silently lands on the next. One key gets roughly triple the headroom.
 2. **Key rotation**: set `GROQ_API_KEYS=key1,key2` (one key per Groq account; keys on the same account share quota) and the chain multiplies again.
 
-The post-call summary deliberately runs on `llama-3.1-8b-instant`: extraction is easy, and it draws from a pool the conversation never touches, so summaries keep working even when the big model's budget is spent.
+The post-call summary deliberately runs on `qwen/qwen3.6-27b`: extraction is easy, and it draws from a pool the conversation never touches, so summaries keep working even when the big model's budget is spent.
 
 ## Honest limitations
 
