@@ -23,9 +23,12 @@ Providers
           and the agent talks in that voice. Metered and NOT free at scale (the
           standing free plan is ~8k credits, roughly 7 minutes of audio a month),
           so like sarvam it is key-gated on FISH_API_KEY and no-ops to edge-tts
-          when unset. Never make it the default for an unattended calling
-          campaign: a mid-run 402 would silently swap the voice.
-          Clone a voice first with Code/fish-voice/fish_voice.py.
+          when unset. A mid-run 402 (balance gone) latches Fish off for the rest
+          of the process after one warning, so the voice swaps to edge once and
+          audibly rather than flapping turn by turn. Still not the right default
+          for an unattended calling campaign, for that same reason.
+          Clone a voice first with Code/fish-voice/fish_voice.py, whose
+          speak_many() checkpoints and resumes a batch across a 402.
 
 Each synth writes a mono 16-bit PCM WAV to wav_path. Whichever sample rate the
 backend emits, downstream faster-whisper and native playback both accept it.
@@ -35,7 +38,10 @@ from __future__ import annotations
 import base64
 import os
 import re
+import time
 import wave
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 # Where kokoro model assets are cached (override with VOICEZERO_CACHE). Kept out
@@ -228,9 +234,21 @@ def _fish(text: str, voice: str, rate: str, wav_path: Path) -> bool:
     live call turn, where responsiveness beats the last few percent of quality.
 
     With no voice id resolved it still works, just in Fish's stock model voice
-    rather than a clone."""
+    rather than a clone.
+
+    402 (out of credit) latches the provider off for the process; 429 buys one
+    short Retry-After wait and then gives the turn to edge. See the comment at
+    the request below for why those two go opposite ways."""
     import json
     import urllib.request
+
+    import urllib.error
+
+    if _fish_quota_spent():
+        # An earlier turn already got a 402. The balance does not refill during a
+        # call, so re-asking every turn just adds a round trip to the latency
+        # budget before falling back to edge anyway.
+        return False
 
     key = (os.getenv("FISH_API_KEY") or os.getenv("FISH_AUDIO_API_KEY") or "").strip()
     if not key:
@@ -266,13 +284,92 @@ def _fish(text: str, voice: str, rate: str, wav_path: Path) -> bool:
             "model": os.getenv("FISH_MODEL", "s2.1-pro"),
         },
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:  # non-200 raises -> fallback
-        audio = resp.read()
+    # 402 and 429 are the two metered-API failures worth telling apart, and a
+    # live call turn needs the opposite treatment from fish-voice's batch:
+    #
+    #   402  the balance is gone. There is no batch to checkpoint here (one turn,
+    #        one clip, nothing owed), so the equivalent of "stop and resume" is to
+    #        LATCH: mark Fish spent for the rest of the process and hand this and
+    #        every later turn to edge-tts. Raised once so agent.py logs a single
+    #        line; silent from then on. Code/fish-voice/fish_voice.py speak_many()
+    #        is the batch path that checkpoints and resumes.
+    #
+    #   429  transient. Worth exactly one short wait, because the caller is a
+    #        human holding a phone: Retry-After is honoured but clamped to
+    #        _FISH_RETRY_CEILING, and anything longer is abandoned to edge for
+    #        this turn only, with no latch.
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                audio = resp.read()
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 402:
+                _FISH_STATE["quota_spent"] = True
+                raise RuntimeError(
+                    "Fish Audio is out of credit (HTTP 402); disabling it for the "
+                    "rest of this process and using edge-tts. Top up at fish.audio "
+                    "or unset FISH_API_KEY to silence this."
+                ) from e
+            if e.code == 429 and attempt == 1:
+                wait = _fish_retry_after(e.headers)
+                if wait is not None and wait <= _FISH_RETRY_CEILING:
+                    time.sleep(wait)
+                    continue
+                return False  # too long to hold a live turn: fall back, no latch
+            raise
     if not audio:
         return False
     # Fish returns a complete WAV container when format=wav.
     wav_path.write_bytes(audio)
     return True
+
+
+# Longest a live turn will sit on a Fish rate limit before handing the line to
+# edge-tts. Beyond a couple of seconds the caller hears dead air, which costs
+# more than the cloned voice is worth for one sentence.
+_FISH_RETRY_CEILING = 2.0
+
+# Process-local latch. A dict rather than a bare global so the flag can be
+# flipped from inside _fish without a `global` statement, and reset in tests.
+_FISH_STATE = {"quota_spent": False}
+
+
+def _fish_quota_spent() -> bool:
+    """True once a 402 has been seen this process."""
+    return bool(_FISH_STATE["quota_spent"])
+
+
+def _fish_reset_quota() -> None:
+    """Re-enable Fish after a 402. For tests and for a long-lived host that
+    knows the balance was topped up."""
+    _FISH_STATE["quota_spent"] = False
+
+
+def _fish_retry_after(headers) -> float | None:
+    """Retry-After in seconds, or None when the header is missing.
+
+    Accepts both legal forms (delta-seconds and HTTP-date). An unparseable
+    value means "the server said wait but we cannot read how long", which is
+    treated as 0.0 (retry now) rather than None (no guidance)."""
+    if headers is None:
+        return None
+    raw = (headers.get("Retry-After") or "").strip()
+    if not raw:
+        return None
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if when is None:
+        return 0.0
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
 
 
 _PROVIDERS = {
