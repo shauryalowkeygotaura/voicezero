@@ -7,3 +7,7 @@ caller_memory.db
 *.mp3
 .venv/
 venv/
+
+# Vendored Groq client written here by Scripts/sync_groq_pool.py before that
+# script learned to skip non-consumers. Nothing here imports it.
+groq_pool.py
