@@ -26,6 +26,12 @@ voicezero is that exact loop, extracted from a real production outbound sales ag
 
 It is not a toy: it has tool calling, personas, template variables, on-the-fly Hindi/English voice switching, prompt-injection sanitization, dead-air protection, model and key rotation, post-call structured summaries, and a JSONL call log.
 
+## Quick start
+
+```bash
+git clone https://github.com/shauryalowkeygotaura/voicezero && cd voicezero && pip install -r requirements.txt && python agent.py
+```
+
 ## The math
 
 Approximate per-minute pricing for hosted voice agent platforms (ballpark, mid 2026, varies by model and voice choices):
